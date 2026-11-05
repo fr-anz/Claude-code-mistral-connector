@@ -39,7 +39,7 @@ class NativeMenuTests(unittest.TestCase):
         opener.open.return_value.__exit__ = Mock(return_value=False)
         with patch('ccmistral.auth.signed_in', return_value=True), patch('ccmistral.__main__.shutil.which', return_value='/bin/claude'), patch(
             'ccmistral.__main__.models', new=AsyncMock(return_value=CATALOG)), patch('ccmistral.picker._selection', return_value={}), patch(
-            'ccmistral.__main__.subprocess.Popen', return_value=process), patch('ccmistral.__main__.urllib.request.build_opener', return_value=opener), patch(
+            'ccmistral.__main__.start_gateway', return_value=(process, 'http://127.0.0.1:3456')), patch('ccmistral.__main__.urllib.request.build_opener', return_value=opener), patch(
             'ccmistral.__main__.subprocess.call', return_value=0) as launch:
             with self.assertRaises(SystemExit) as stopped:
                 run(args)
@@ -50,6 +50,7 @@ class NativeMenuTests(unittest.TestCase):
         self.assertTrue(settings['modelPicker']['replaceBuiltInOptions'])
         self.assertEqual(len(settings['modelPicker']['options']), 3)
         self.assertEqual(launch.call_args.kwargs['env']['ANTHROPIC_MODEL'], 'glm-5.3-flash')
+        self.assertEqual(launch.call_args.kwargs['env']['ENABLE_TOOL_SEARCH'], 'false')
         self.assertEqual(launch.call_args.kwargs['env']['CLAUDE_CODE_MAX_CONTEXT_TOKENS'], '1048576')
         process.terminate.assert_called_once()
 

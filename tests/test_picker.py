@@ -46,6 +46,7 @@ class PickerTests(unittest.TestCase):
             main()
         self.assertIsNone(run.call_args.args[0].model)
         self.assertEqual(run.call_args.args[0].command, 'run')
+        self.assertEqual(run.call_args.args[0].port, 0)
 
 
 if __name__ == '__main__':

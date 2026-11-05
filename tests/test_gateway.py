@@ -59,7 +59,7 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(answer['content'][0]['input'], {'path': 'a.py'})
         self.assertEqual(answer['stop_reason'], 'tool_use')
 
-    def test_unsupported_image_is_rejected(self):
+    def test_image_without_source_is_rejected(self):
         with self.assertRaises(Unsupported):
             translate({'messages': [{'role': 'user', 'content': [{'type': 'image'}]}]}, 'test')
 

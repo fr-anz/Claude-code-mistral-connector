@@ -5,7 +5,7 @@ Run Claude Code with Mistral-hosted coding models through a local gateway. The
 translates between Claude Code's Messages API and Mistral chat completions.
 
 ```text
-Claude Code → local gateway (127.0.0.1:3456) → Mistral
+Claude Code → local gateway (127.0.0.1:auto-port) → Mistral
 ```
 
 The connector uses Vibe's normal browser sign-in to provision a plan credential,
@@ -20,6 +20,8 @@ a successful model request alone does not verify which allowance is charged.
 - Select Mistral-hosted models in Claude Code's native `/model` menu.
 - Change thinking independently with `/effort` during a session.
 - Stream text and tool-call arguments, and translate tool results back to Mistral.
+- Send images and documents, including images returned by Read and MCP tools.
+- Translate JSON schema output and custom tools while preserving names and inputs.
 - Support system instructions, including Claude Code's inline system messages.
 - Read context and output limits from the live coding catalog, with published
   defaults for GLM 5.3, GLM 5.3 Flash and Mistral Large 4.
@@ -104,13 +106,46 @@ Other models use reasoning settings advertised by the live catalog. The
 | `claude-mistral run --model MODEL_ID --thinking high` | Set an initial effort level |
 
 Use an exact ID from `models`. Effort remains changeable with `/effort`.
-`run --port 3457` chooses another gateway port. Pass Claude Code arguments after
+Each launch automatically reserves its own free loopback port, so multiple
+terminals and worker processes can run concurrently. `run --port 3457` pins a
+specific port instead. Pass Claude Code arguments after
 `--`, for example:
 
 ```bash
 claude-mistral run --model MODEL_ID -- --resume
 claude-mistral run --model MODEL_ID -- --permission-mode plan
 ```
+
+### Concurrent workers and an orchestrator
+
+Run `claude-mistral` in each terminal; no manual port configuration is needed.
+Each launch owns its gateway process, local authentication secret and upstream
+session. Exiting one launch shuts down its gateway without stopping other workers.
+An explicitly requested port that is already occupied fails with a clear error.
+
+An orchestrator can launch independent noninteractive workers with ordinary
+subprocesses. For example, these two workers run concurrently:
+
+```bash
+claude-mistral run -- -p "Review the API code; do not edit files" --output-format json > api-review.json &
+claude-mistral run -- -p "Review the tests; do not edit files" --output-format json > test-review.json &
+wait
+```
+
+The orchestrator should collect each process's stdout and exit status. Launcher
+and gateway messages go to stderr, leaving stdout for Claude Code's output.
+Claude Code arguments such as `--agent`, `--agents`, `--model` and `--worktree`
+can be passed after `--`; use connector `--model` before `--` to select a Mistral
+model. Independent workers can be started from a Claude Code parent session:
+the launcher clears the inherited `CLAUDECODE` nesting marker only for its child.
+
+This supports external orchestration; it does not automatically assign tasks or
+collect worker results. Claude Code's own in-session subagents can share the
+parent gateway. Keep the launcher running for the lifetime of its workers;
+detached Claude processes such as `--background` outlive the launcher and are
+not supported by this gateway lifecycle. Concurrent workers share account usage
+limits. For workers that edit files, use separate worktrees or divide file
+ownership to avoid overlapping edits.
 
 The launcher chooses an earlier saved connector model when available, otherwise
 the catalog recommendation. It chooses its starting model independently of the
@@ -126,7 +161,8 @@ switches for this session only; Enter lets Claude Code save its own default.
    not overwrite Vibe's existing credentials or persist a key in `.env`.
 2. The connector fetches `/v1/model-catalog?surface=vibe-code`, falling back to
    `/v1/models` only on HTTP 404 or 405. Enabled entries populate the native picker.
-3. The launcher starts an authenticated gateway on `127.0.0.1:3456` and passes
+3. The launcher starts an authenticated gateway on an automatically assigned
+   `127.0.0.1` port and passes
    its URL, an ephemeral local secret and model settings to Claude Code.
 4. For each `/v1/messages` request, the gateway resolves the selected model and
    effort, translates messages and tools, and calls Mistral chat completions.
@@ -185,11 +221,44 @@ non-1M window or output ceiling, restart with `--model MODEL_ID` to update the
 client's overrides. The gateway applies output limits per request. Automatic
 compaction remains enabled, and `/context` shows the effective client window.
 
+## Images, documents and tool compatibility
+
+Image URL and base64 blocks are translated to Mistral's image content chunks,
+including images inside tool results. JPEG, PNG, GIF and WebP are accepted by
+the router; the selected model determines which formats it can process. Text
+and PDF document blocks are translated to text or document URL chunks. Media
+support and document processing depend on the selected model and entitlement.
+If the catalog explicitly marks a model as lacking vision, image requests return
+an error asking you to choose a vision-capable model with `/model`. The router
+does not switch models automatically.
+
+Claude Code executes its local tools. The gateway translates their definitions,
+calls and results to the chat-completions format used by Vibe; it does not run
+a separate Vibe agent or rename Claude tools to Vibe tools. Tool names, input
+schemas, strict settings, parallel-call settings and error results are preserved.
+Long Claude tool-call IDs are consistently mapped to Mistral-compatible IDs in
+history so results stay paired with their calls.
+
+The launcher sets `ENABLE_TOOL_SEARCH=false` for its Claude Code process to load
+MCP tool definitions upfront. Mistral does not provide Anthropic's hosted tool
+search service. Tool references from resumed custom-tool searches are represented
+as available-tool text, with custom definitions forwarded eagerly. Loading all
+MCP tools can use more context. See [Claude Code tool-search configuration](https://code.claude.com/docs/en/mcp#configure-tool-search).
+
+JSON schema formats in `output_config.format` (or legacy `output_format`) map to
+Mistral's `response_format`. Native `/model`, `/effort`, and Claude Code permission
+modes continue to work independently. See Mistral's [vision](https://docs.mistral.ai/inference/conversations/vision)
+and [structured-output](https://docs.mistral.ai/inference/conversations/structured-output/custom) documentation.
+
+Restart `claude-mistral` after updating to use the new routing and launcher settings.
+
 ## Limitations and troubleshooting
 
 - Live chat has been exercised, but automated tests use simulated upstreams.
   Subscription allowance deductions are not independently verified.
-- Images, hosted tools and multimodal tool results are unsupported.
+- Anthropic-hosted tools, audio/video blocks and Anthropic file-ID media sources
+  are unsupported. PDF processing requires upstream document support; the gateway
+  does not implement local OCR. Requests remain limited to 16 MiB including base64.
 - Thinking blocks are omitted from history, and structured upstream thinking is
   excluded from answer text. Prompt-cache directives are not translated.
 - Exact token counting, remaining-allowance tracking and some Claude-specific
@@ -199,7 +268,8 @@ compaction remains enabled, and `/context` shows the effective client window.
   Retry `login` if Mistral rejects or cannot refresh it.
 - Login requires network access and a usable keyring. There is no plaintext
   credential-storage or developer-key fallback.
-- If the port is occupied, use `run --port NUMBER`.
+- Ports are allocated automatically. If an explicit `--port` is occupied, omit
+  it or choose another number.
 - If an updated Vibe release removes the private browser sign-in interfaces, use the tested
   version or update the adapter.
 

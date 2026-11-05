@@ -1,10 +1,88 @@
 """Anthropic Messages ↔ Mistral chat completions translation."""
+import base64
+import hashlib
 import json
+import re
 import uuid
 
 
 class Unsupported(ValueError):
     pass
+
+
+def tool_id(value):
+    """Keep native Mistral IDs; consistently map longer Claude/MCP IDs."""
+    if not isinstance(value, str) or not value:
+        raise Unsupported('Tool calls require a nonempty ID')
+    if re.fullmatch(r'[a-zA-Z0-9]{9}', value):
+        return value
+    return hashlib.sha256(value.encode()).hexdigest()[:9]
+
+
+def source_url(source, media_type):
+    if not isinstance(source, dict):
+        raise Unsupported('Media source must be an object')
+    kind = source.get('type')
+    if kind == 'url':
+        url = source.get('url')
+        if not isinstance(url, str) or not url.startswith(('https://', 'http://')):
+            raise Unsupported('Media URLs must use HTTP or HTTPS')
+        return url
+    if kind == 'base64':
+        mime, data = source.get('media_type'), source.get('data')
+        if mime not in media_type or not isinstance(data, str) or not data:
+            raise Unsupported('Unsupported media type or empty base64 data')
+        try:
+            base64.b64decode(data, validate=True)
+        except ValueError:
+            raise Unsupported('Invalid base64 media data') from None
+        return f'data:{mime};base64,{data}'
+    raise Unsupported('Media source must be a URL or base64 data')
+
+
+def content_parts(content, *, references=False):
+    if isinstance(content, str):
+        return [{'type': 'text', 'text': content}]
+    if not isinstance(content, list):
+        raise Unsupported('Content must be text or an array of blocks')
+    parts = []
+    for block in content:
+        kind = block.get('type')
+        if kind == 'text':
+            parts.append({'type': 'text', 'text': block['text']})
+        elif kind == 'image':
+            parts.append({'type': 'image_url', 'image_url': {'url': source_url(
+                block.get('source', {}), ('image/jpeg', 'image/png', 'image/gif', 'image/webp'))}})
+        elif kind == 'document':
+            source = block.get('source', {})
+            if source.get('type') == 'text':
+                parts.append({'type': 'text', 'text': source['data']})
+            elif source.get('type') == 'content':
+                parts.extend(content_parts(source['content']))
+            elif source.get('type') == 'base64' and source.get('media_type') == 'text/plain':
+                url = source_url(source, ('text/plain',))
+                try:
+                    text = base64.b64decode(url.split(',', 1)[1]).decode('utf-8')
+                except UnicodeError:
+                    raise Unsupported('Text documents must contain UTF-8') from None
+                parts.append({'type': 'text', 'text': text})
+            else:
+                item = {'type': 'document_url', 'document_url': source_url(source, ('application/pdf',))}
+                if block.get('title'):
+                    item['document_name'] = block['title']
+                parts.append(item)
+        elif kind == 'tool_reference' and references:
+            # All custom definitions are sent eagerly, including deferred tools.
+            parts.append({'type': 'text', 'text': f"Available tool: {block['tool_name']}"})
+        else:
+            raise Unsupported(f'Unsupported content block: {kind}')
+    return parts
+
+
+def pack_content(parts):
+    if all(part['type'] == 'text' for part in parts):
+        return '\n'.join(part['text'] for part in parts)
+    return parts
 
 
 def system_text(content):
@@ -42,28 +120,31 @@ def translate(body, model):
         if isinstance(content, str):
             messages.append({'role': role, 'content': content})
             continue
-        text, calls, results = [], [], []
+        if not isinstance(content, list):
+            raise Unsupported('Content must be text or an array of blocks')
+        parts, calls, results = [], [], []
         for block in content:
             kind = block.get('type')
-            if kind == 'text':
-                text.append(block['text'])
+            if kind in ('text', 'image', 'document'):
+                if role == 'assistant' and kind != 'text':
+                    raise Unsupported('Media blocks require a user message or tool result')
+                parts.extend(content_parts([block]))
             elif kind == 'tool_use' and role == 'assistant':
-                calls.append({'id': block['id'], 'type': 'function', 'function': {
+                calls.append({'id': tool_id(block['id']), 'type': 'function', 'function': {
                     'name': block['name'], 'arguments': json.dumps(block['input'])}})
             elif kind == 'tool_result' and role == 'user':
-                result = block.get('content', '')
-                if isinstance(result, list):
-                    if any(b.get('type') != 'text' for b in result):
-                        raise Unsupported('Only text tool results are supported')
-                    result = '\n'.join(b['text'] for b in result)
-                results.append({'role': 'tool', 'tool_call_id': block['tool_use_id'], 'content': result})
+                result_parts = content_parts(block.get('content', ''), references=True)
+                if block.get('is_error'):
+                    result_parts.insert(0, {'type': 'text', 'text': 'Tool execution failed:'})
+                results.append({'role': 'tool', 'tool_call_id': tool_id(block['tool_use_id']),
+                                'content': pack_content(result_parts)})
             elif kind in ('thinking', 'redacted_thinking'):
                 continue
             else:
                 raise Unsupported(f'Unsupported content block: {kind}')
         messages.extend(results)
-        if text or calls:
-            item = {'role': role, 'content': '\n'.join(text) or None}
+        if parts or calls:
+            item = {'role': role, 'content': pack_content(parts) or None}
             if calls:
                 item['tool_calls'] = calls
             messages.append(item)
@@ -73,14 +154,25 @@ def translate(body, model):
             result[key] = body[key]
     if body.get('stop_sequences'):
         result['stop'] = body['stop_sequences']
+    output_format = body.get('output_config', {}).get('format') or body.get('output_format')
+    if output_format:
+        if output_format.get('type') != 'json_schema' or not isinstance(output_format.get('schema'), dict):
+            raise Unsupported('Output format must be json_schema with an object schema')
+        result['response_format'] = {'type': 'json_schema', 'json_schema': {
+            'name': 'response', 'schema': output_format['schema'], 'strict': True}}
     if body.get('tools'):
         tools = []
         for tool in body['tools']:
             if tool.get('type', 'custom') != 'custom':
-                raise Unsupported('Provider-hosted tools are unsupported')
-            tools.append({'type': 'function', 'function': {
+                # Claude Code recognizes this form and can retry without
+                # optional hosted tools (for example the advisor tool).
+                raise Unsupported(f"Input tag '{tool.get('type')}' is unsupported: provider-hosted tools require Anthropic")
+            function = {
                 'name': tool['name'], 'description': tool.get('description', ''),
-                'parameters': tool['input_schema']}})
+                'parameters': tool['input_schema']}
+            if 'strict' in tool:
+                function['strict'] = tool['strict']
+            tools.append({'type': 'function', 'function': function})
         result['tools'] = tools
     choice = body.get('tool_choice', {})
     if choice:

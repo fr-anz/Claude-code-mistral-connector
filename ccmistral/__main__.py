@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -22,7 +23,9 @@ def main():
         item = sub.add_parser(command)
         item.add_argument('--model', required=command == 'serve',
                           help='Exact Mistral model ID; omit to start with your last or the recommended model')
-        item.add_argument('--port', type=int, default=3456)
+        item.add_argument('--port', type=int, default=3456 if command == 'serve' else 0,
+                          help='Gateway port; run defaults to an automatically assigned free port')
+        item.add_argument('--fd', type=int, help=argparse.SUPPRESS)
         item.add_argument('--thinking', help='Initial thinking level; /effort can change it during the session')
         if command == 'run':
             item.add_argument('claude_args', nargs=argparse.REMAINDER)
@@ -44,7 +47,7 @@ def main():
                 sys.exit('Set CC_MISTRAL_LOCAL_TOKEN to a random local gateway secret, or use run.')
             catalog = json.loads(os.environ['CC_MISTRAL_CATALOG']) if 'CC_MISTRAL_CATALOG' in os.environ else None
             uvicorn.run(create_app(args.model, token, thinking=args.thinking, catalog=catalog),
-                        host='127.0.0.1', port=args.port, access_log=False)
+                        host='127.0.0.1', port=args.port, fd=args.fd, access_log=False)
         else:
             run(args)
     except KeyboardInterrupt:
@@ -70,6 +73,24 @@ async def models():
         return prepare_catalog(data['models'] if 'models' in data else data['data'])
 
 
+def start_gateway(model, port, thinking, env):
+    # Reserve the socket until the child inherits it. Probing a free port and
+    # closing it before launch would race with concurrent agent launches.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        try:
+            listener.bind(('127.0.0.1', port))
+            listener.listen(128)
+        except (OSError, OverflowError) as exc:
+            raise ValueError(f'Cannot bind gateway port {port}: {exc}. Omit --port to choose a free port.') from None
+        actual_port = listener.getsockname()[1]
+        command = [sys.executable, '-m', 'ccmistral', 'serve', '--model', model,
+                   '--port', str(actual_port), '--fd', str(listener.fileno())]
+        if thinking is not None:
+            command.extend(['--thinking', thinking])
+        process = subprocess.Popen(command, env=env, pass_fds=(listener.fileno(),))
+    return process, f'http://127.0.0.1:{actual_port}'
+
+
 def run(args):
     from .auth import signed_in
     if not shutil.which('claude'):
@@ -78,7 +99,7 @@ def run(args):
         sys.exit('Run claude-mistral login to provision a Vibe credential. Previous OIDC sessions are no longer used.')
     from .catalog import context_environment, initial_route, native_models
     from .picker import _selection
-    print('Loading Mistral models…', flush=True)
+    print('Loading Mistral models…', file=sys.stderr, flush=True)
     catalog = asyncio.run(models())
     saved = _selection()
     try:
@@ -89,13 +110,11 @@ def run(args):
     _, options = native_models(catalog)
     settings = {'modelPicker': {'replaceBuiltInOptions': True, 'options': options}}
     token = secrets.token_urlsafe(32)
-    base = f'http://127.0.0.1:{args.port}'
     env = dict(os.environ, CC_MISTRAL_LOCAL_TOKEN=token, CC_MISTRAL_CATALOG=json.dumps(catalog))
-    command = [sys.executable, '-m', 'ccmistral', 'serve', '--model', args.model,
-               '--port', str(args.port)]
-    if args.thinking is not None:
-        command.extend(['--thinking', args.thinking])
-    process = subprocess.Popen(command, env=env)
+    try:
+        process, base = start_gateway(args.model, args.port, args.thinking, env)
+    except ValueError as exc:
+        sys.exit(str(exc))
     try:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for _ in range(100):
@@ -120,17 +139,22 @@ def run(args):
                      ANTHROPIC_DEFAULT_SONNET_MODEL=initial, ANTHROPIC_DEFAULT_HAIKU_MODEL=initial,
                      ANTHROPIC_DEFAULT_FABLE_MODEL=initial,
                      CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY='1',
-                     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1')
+                     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1',
+                     ENABLE_TOOL_SEARCH='false')
+        # Mistral has no Anthropic hosted tool-search service. Load MCP tool
+        # definitions upfront; resumed tool_reference results are translated.
         child.update(context_environment(catalog, args.model))
         # A pre-existing 1M opt-out would negate the catalog-derived suffix.
         child.pop('CLAUDE_CODE_DISABLE_1M_CONTEXT', None)
+        # Independent worker sessions may be launched by a Claude orchestrator.
+        child.pop('CLAUDECODE', None)
         extra = args.claude_args
         if extra[:1] == ['--']:
             extra = extra[1:]
         print(f'Routing Claude Code to Mistral model {args.model}'
               + (f' · thinking: {args.thinking}' if args.thinking else '')
-              + '. Billing allocation is not yet verified.', flush=True)
-        print('Use /model to switch models and /effort to change thinking level.', flush=True)
+              + f' via {base}. Billing allocation is not yet verified.', file=sys.stderr, flush=True)
+        print('Use /model to switch models and /effort to change thinking level.', file=sys.stderr, flush=True)
         launch = ['claude', '--permission-mode', 'bypassPermissions',
                   '--settings', json.dumps(settings)]
         if args.thinking is not None:

@@ -101,6 +101,13 @@ def create_app(model, token, *, thinking=None, catalog=None, get_headers=auth.he
             if catalog is not None:
                 from .model_limits import output_limit
                 entry = next(item for item in catalog if item['id'] == selected_model)
+                capabilities = entry.get('capabilities') or {}
+                if capabilities.get('vision') is False and any(
+                    isinstance(message.get('content'), list) and any(
+                        part.get('type') == 'image_url' for part in message['content'])
+                    for message in payload['messages']
+                ):
+                    raise Unsupported(f'{selected_model} does not support images. Choose a vision-capable model with /model.')
                 maximum = output_limit(entry)
                 if maximum is not None:
                     if payload.get('max_tokens', maximum) > maximum:
