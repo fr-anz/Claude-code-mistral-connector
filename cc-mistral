@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Run with the Python environment belonging to the installed Vibe CLI."""
+import os
+from pathlib import Path
+import shutil
+import sys
+
+root = Path(__file__).resolve().parent
+vibe = shutil.which('vibe')
+if not vibe:
+    sys.exit('Install Mistral Vibe first; CC-Mistral reuses its OIDC implementation.')
+with open(Path(vibe).resolve(), 'rb') as handle:
+    first = handle.readline().decode().strip()
+if not first.startswith('#!') or not Path(first[2:]).is_file():
+    sys.exit('Cannot find Vibe Python. Run its Python with -m ccmistral from this folder.')
+os.environ['PYTHONPATH'] = str(root) + os.pathsep + os.environ.get('PYTHONPATH', '')
+os.execv(first[2:], [first[2:], '-m', 'ccmistral', *sys.argv[1:]])
