@@ -14,9 +14,9 @@ import urllib.request
 def main():
     parser = argparse.ArgumentParser(description='Claude Code → Mistral using Vibe browser sign-in')
     sub = parser.add_subparsers(dest='command')
-    login = sub.add_parser('login', help='Sign in through Vibe OIDC (experimental)')
+    login = sub.add_parser('login', help='Provision a Vibe plan credential through browser sign-in')
     login.add_argument('--no-browser', action='store_true')
-    sub.add_parser('status', help='Check for a stored OIDC session without making requests')
+    sub.add_parser('status', help='Check for a browser-provisioned Vibe credential, offline')
     sub.add_parser('models', help='List models available to the signed-in account')
     for command in ('serve', 'run'):
         item = sub.add_parser(command)
@@ -32,7 +32,7 @@ def main():
         if args.command == 'login':
             asyncio.run(auth.login(not args.no_browser))
         elif args.command == 'status':
-            print('OIDC session stored (not validated online).' if auth.signed_in() else 'No matching OIDC session. Run claude-mistral login.')
+            print('Browser-provisioned Vibe credential stored (not validated online).' if auth.signed_in() else 'No browser-provisioned Vibe credential. Run claude-mistral login again; experimental OIDC sessions are no longer used.')
         elif args.command == 'models':
             for item in asyncio.run(models()):
                 print(item['id'])
@@ -50,7 +50,7 @@ def main():
     except KeyboardInterrupt:
         sys.exit(130)
     except Exception:
-        sys.exit('Operation failed. Check network access, Vibe OIDC support and system keyring availability. No API-key fallback was attempted.')
+        sys.exit('Operation failed. Check network access, Vibe browser sign-in support and system keyring availability. No developer API key or OIDC fallback was attempted.')
 
 
 async def models():
@@ -75,7 +75,7 @@ def run(args):
     if not shutil.which('claude'):
         sys.exit('Claude Code is not installed or not on PATH.')
     if not signed_in():
-        sys.exit('No matching Mistral OIDC session. Run claude-mistral login first.')
+        sys.exit('Run claude-mistral login to provision a Vibe credential. Previous OIDC sessions are no longer used.')
     from .catalog import context_environment, initial_route, native_models
     from .picker import _selection
     print('Loading Mistral models…', flush=True)

@@ -32,7 +32,7 @@ They do not make model requests or spend subscription usage.
 | --- | --- |
 | `cc-mistral` | Locate Vibe's interpreter and run the CLI |
 | `ccmistral/__main__.py` | Commands, catalog loading and Claude Code launch |
-| `ccmistral/auth.py` | Vibe OIDC integration and browser login |
+| `ccmistral/auth.py` | Vibe browser credential provisioning and keyring storage |
 | `ccmistral/catalog.py` | Native model picker entries and context configuration |
 | `ccmistral/model_limits.py` | Published fallback limits and excluded models |
 | `ccmistral/thinking.py` | Model-specific reasoning levels and request effort |
@@ -43,8 +43,9 @@ They do not make model requests or spend subscription usage.
 
 ## Implementation guidelines
 
-- Keep Mistral credentials in Vibe's existing keyring workflow. Do not add
-  credential scraping, plaintext storage or an API-key fallback.
+- Provision credentials through Vibe's browser sign-in service and store them
+  only in the connector's OS keyring slot. Do not add credential scraping,
+  plaintext storage, developer-key fallback or experimental OIDC fallback.
 - Preserve loopback binding, local request authentication and upstream error
   redaction. Never log tokens, authorization headers or complete private prompts.
 - Keep native `/model` and `/effort` controls independent.

@@ -1,6 +1,7 @@
 import json
 import os
 import secrets
+import uuid
 
 import httpx2
 from starlette.applications import Starlette
@@ -28,6 +29,7 @@ def create_app(model, token, *, thinking=None, catalog=None, get_headers=auth.he
 
     from .catalog import native_models
     routes, options = native_models(catalog) if catalog is not None else ({}, [])
+    session_id = str(uuid.uuid4())
 
     def authorized(request):
         candidates = (request.headers.get('x-api-key', ''),
@@ -37,8 +39,8 @@ def create_app(model, token, *, thinking=None, catalog=None, get_headers=auth.he
     async def health(request):
         if not authorized(request):
             return error('Local gateway authentication required', 401, 'authentication_error')
-        return JSONResponse({'status': 'ok', 'model': model, 'auth': 'mistral-vibe-oidc',
-                             'thinking': thinking, 'billing_verified': False})
+        return JSONResponse({'status': 'ok', 'model': model, 'auth': 'mistral-vibe-browser-plan',
+                             'thinking': thinking, 'call_source': 'vibe_code', 'billing_verified': False})
 
     async def list_models(request):
         if not authorized(request):
@@ -88,6 +90,12 @@ def create_app(model, token, *, thinking=None, catalog=None, get_headers=auth.he
                 except ValueError as exc:
                     raise Unsupported(str(exc) + '. Change it with /effort.') from None
             payload = translate(body, selected_model)
+            # Vibe attributes completions separately from OIDC authentication.
+            # Keep the connector identified while using Vibe Code's call source.
+            payload['metadata'] = {
+                'call_source': 'vibe_code', 'client_name': 'claude-mistral',
+                'host_kind': 'local', 'session_id': session_id,
+            }
             if selected_thinking is not None:
                 payload['reasoning_effort'] = selected_thinking
             if catalog is not None:
@@ -102,8 +110,10 @@ def create_app(model, token, *, thinking=None, catalog=None, get_headers=auth.he
             return error(str(exc) if isinstance(exc, Unsupported) else 'Malformed Messages request')
         try:
             upstream_headers = await get_headers(BASE + '/chat/completions')
+            upstream_headers = dict(upstream_headers)
+            upstream_headers['x-affinity'] = session_id
         except Exception:
-            return error('Mistral sign-in required or session refresh failed. Run ./cc-mistral login.', 401, 'authentication_error')
+            return error('Vibe browser credential missing or unreadable. Run claude-mistral login.', 401, 'authentication_error')
         client = httpx2.AsyncClient(timeout=httpx2.Timeout(300, connect=20), follow_redirects=False,
                                     trust_env=False, transport=transport)
         try:
@@ -118,7 +128,7 @@ def create_app(model, token, *, thinking=None, catalog=None, get_headers=auth.he
             await upstream.aclose()
             await client.aclose()
             # Never echo upstream bodies, which can contain credential details.
-            message = {401: 'Mistral rejected the session. Run ./cc-mistral login.',
+            message = {401: 'Mistral rejected the session. Run claude-mistral login.',
                        402: 'Mistral reports that usage allowance or credits are exhausted.',
                        403: 'Mistral denied access to this model or subscription.',
                        429: 'Mistral rate or usage limit reached.'}.get(code, f'Mistral returned HTTP {code}')

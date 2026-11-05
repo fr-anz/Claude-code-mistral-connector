@@ -8,10 +8,12 @@ translates between Claude Code's Messages API and Mistral chat completions.
 Claude Code → local gateway (127.0.0.1:3456) → Mistral
 ```
 
-The connector uses Vibe's OIDC session and operating system keyring. It does not
-request a Mistral API key or fall back to an Anthropic model. Subscription access,
-usage limits and billing allocation are determined by Mistral; successful login
-or a model appearing in the picker does not verify which allowance is charged.
+The connector uses Vibe's normal browser sign-in to provision a plan credential,
+then stores it in the operating system keyring. Internally this credential is an
+API key issued by Vibe's sign-in service; you do not create or paste a developer
+API key. Existing developer keys and experimental OIDC sessions are not used.
+Subscription access, usage limits and billing allocation are determined by Mistral;
+a successful model request alone does not verify which allowance is charged.
 
 ## Features
 
@@ -32,11 +34,11 @@ permission prompts. To choose another mode for a launch, pass it after `--`.
 
 - Linux or macOS with a browser and a working operating system keyring.
 - Claude Code CLI on `PATH`; custom picker rows require version 2.1.242 or newer.
-- Mistral Vibe CLI on `PATH`, with the experimental OIDC modules available.
+- Mistral Vibe CLI on `PATH`, with its browser sign-in modules available.
 - `starlette`, `uvicorn` and `httpx2` in Vibe's Python environment.
 - A Mistral account with access to the selected model.
 
-Developed against Mistral Vibe 3.1.0 and Claude Code 2.1.318. Vibe's private OIDC
+Developed against Mistral Vibe 3.1.0 and Claude Code 2.1.318. Vibe's private browser sign-in
 interfaces can change between releases. The launcher expects a Python-script Vibe
 installation with a shebang pointing to its interpreter.
 
@@ -95,7 +97,7 @@ Other models use reasoning settings advertised by the live catalog. The
 | --- | --- |
 | `claude-mistral login` | Sign in through the browser |
 | `claude-mistral login --no-browser` | Print the login URL for manual opening |
-| `claude-mistral status` | Check for a matching stored OIDC session, offline |
+| `claude-mistral status` | Check for a browser-provisioned Vibe credential, offline |
 | `claude-mistral models` | List enabled model IDs |
 | `claude-mistral` | Launch Claude Code with the native model picker configured |
 | `claude-mistral run --model MODEL_ID` | Choose the initial model explicitly |
@@ -117,22 +119,53 @@ switches for this session only; Enter lets Claude Code save its own default.
 
 ## How it works
 
-1. Browser login uses Vibe's OIDC service, PKCE and validated tokens. Vibe stores
-   the session in its operating system keyring slot. The callback is
-   `http://127.0.0.1:8766/callback`. This session is shared with Vibe.
+1. Browser login uses Vibe's `BrowserSignInService` and PKCE. The service starts
+   `/api/vibe/sign-in` at the Mistral console, polls for browser authorization,
+   then exchanges the result for a Vibe credential. The connector stores that
+   credential in its own OS keyring slot, `ai.claude-mistral.vibe-plan`. It does
+   not overwrite Vibe's existing credentials or persist a key in `.env`.
 2. The connector fetches `/v1/model-catalog?surface=vibe-code`, falling back to
    `/v1/models` only on HTTP 404 or 405. Enabled entries populate the native picker.
 3. The launcher starts an authenticated gateway on `127.0.0.1:3456` and passes
    its URL, an ephemeral local secret and model settings to Claude Code.
 4. For each `/v1/messages` request, the gateway resolves the selected model and
    effort, translates messages and tools, and calls Mistral chat completions.
-   Vibe handles session refresh and organization/workspace headers.
+   The browser-provisioned credential supplies its workspace scope. A rejected
+   credential requires a fresh `login`; there is no fallback to OIDC or a
+   developer key.
 5. Responses are translated back to Anthropic Messages JSON or SSE events.
    The gateway terminates when the launched Claude Code process exits.
 
 Credentials are not written into the repository. The local gateway secret is not
 a Mistral API key. Upstream error bodies are redacted, and HTTP 402/429 responses
 stop the request without trying another provider or account.
+
+Completion requests carry `metadata.call_source = "vibe_code"`, the Vibe SDK
+User-Agent with an additional connector identifier, and stable session affinity.
+These fields describe request attribution, not a server-confirmed billing result.
+The actual endpoint remains `/v1/chat/completions`, as in Vibe itself, so a request
+being called a completion does not by itself identify its allowance.
+
+### Migrating from experimental OIDC login
+
+Earlier connector versions used experimental OIDC authentication. Adding Vibe
+metadata to those requests did not resolve the reported API-allowance usage.
+The connector now requires Vibe's normal browser-provisioned credential:
+
+```bash
+claude-mistral login
+claude-mistral
+```
+
+Existing OIDC sessions are left untouched but are no longer used by this connector.
+Mistral's [plan-key documentation](https://help.mistral.ai/en/articles/698531-why-am-i-hitting-api-rate-limits-and-how-do-i-increase-them)
+distinguishes Vibe plan budgets from general API credentials. The new flow follows
+Vibe's own browser credential provisioning; billing still needs live verification.
+
+Note both the API and Vibe Code usage counters, stop other activity, sign in again,
+send a small test, and compare the counters after the dashboard updates. Rounded
+counters may not visibly change for a tiny request. The automated tests verify the
+credential flow and request contents, not server-side billing allocation.
 
 ## Context and output limits
 
@@ -165,9 +198,9 @@ compaction remains enabled, and `/context` shows the effective client window.
 - A stored session reported by `status` does not prove it is still valid online.
   Retry `login` if Mistral rejects or cannot refresh it.
 - Login requires network access and a usable keyring. There is no plaintext
-  credential-storage or API-key fallback.
+  credential-storage or developer-key fallback.
 - If the port is occupied, use `run --port NUMBER`.
-- If an updated Vibe release removes the private OIDC interfaces, use the tested
+- If an updated Vibe release removes the private browser sign-in interfaces, use the tested
   version or update the adapter.
 
 ## Development
